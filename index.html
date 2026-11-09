@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>reCAPTCHA v3 — проверка score</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 30px 16px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #10141c; color: #e7edf7; }
+    .container { max-width: 1050px; margin: 0 auto; }
+    .card { padding: 24px; border: 1px solid #30394a; border-radius: 14px; background: #171d28; box-shadow: 0 12px 40px rgba(0, 0, 0, .28); }
+    h1 { margin-top: 0; font-size: clamp(23px, 4vw, 30px); }
+    p { line-height: 1.55; color: #b9c3d4; }
+    button { padding: 13px 22px; border: 0; border-radius: 9px; background: #4c7dff; color: #fff; font-size: 16px; font-weight: 700; cursor: pointer; }
+    button:hover { filter: brightness(1.08); }
+    button:disabled { cursor: wait; opacity: .55; }
+    .status { margin: 18px 0; padding: 14px; border-radius: 9px; background: #0e131c; white-space: pre-wrap; }
+    .score { margin: 18px 0; padding: 18px; border-radius: 10px; background: #20283a; font-size: 22px; font-weight: 800; }
+    pre { overflow: auto; max-height: 700px; padding: 18px; border-radius: 10px; background: #090c12; color: #c9e5ff; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+    code { color: #9fc3ff; overflow-wrap: anywhere; }
+    .warning { margin-bottom: 20px; padding: 14px; border-left: 4px solid #ffb84d; background: #2a2418; color: #f6deaf; line-height: 1.5; }
+    small { color: #92a1bb; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <section class="card">
+      <h1>reCAPTCHA v3 — диагностическая страница</h1>
+      <div class="warning">Это тестовая страница: она показывает score и технические сведения о вашем браузере. Не используйте результат как самостоятельную проверку личности.</div>
+      <p>Site key: <code id="site-key-label"></code></p>
+      <p>Action: <code id="action-label"></code></p>
+      <p>Проверка токена: <code id="worker-label"></code></p>
+      <button id="check-button" type="button">Проверить reCAPTCHA</button>
+      <div id="status" class="status" role="status" aria-live="polite">Ожидание нажатия кнопки.</div>
+      <div id="score-box" class="score" hidden></div>
+      <pre id="result">Результат пока отсутствует.</pre>
+      <small>Проверка запускается только после нажатия кнопки. Каждый токен reCAPTCHA используется один раз.</small>
+    </section>
+  </main>
+
+  <script>
+  'use strict';
+
+  // ====== ИЗМЕНИТЕ ТОЛЬКО ЭТИ ДВА ПАРАМЕТРА ======
+  const SITE_KEY = 'PASTE_NEW_RECAPTCHA_V3_SITE_KEY_HERE';
+  const WORKER_URL = 'https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev';
+  // ================================================
+  const ACTION = 'login';
+
+  const button = document.getElementById('check-button');
+  const statusBox = document.getElementById('status');
+  const resultBox = document.getElementById('result');
+  const scoreBox = document.getElementById('score-box');
+
+  document.getElementById('site-key-label').textContent = SITE_KEY;
+  document.getElementById('action-label').textContent = ACTION;
+  document.getElementById('worker-label').textContent = WORKER_URL;
+
+  const configured = !SITE_KEY.startsWith('PASTE_') &&
+    /^https:\/\/[^\s/]+\.workers\.dev\/?$/.test(WORKER_URL);
+
+  if (!configured) {
+    button.disabled = true;
+    statusBox.textContent = 'Сначала укажите SITE_KEY и WORKER_URL в начале JavaScript этого файла.';
+  }
+
+  // Счётчики активности перенесены из исходного PHP/JS проекта.
+  const pageOpenedAt = performance.now();
+  const activity = {
+    mouseMoveCount: 0, mouseDistancePixels: 0, pointerDownCount: 0,
+    clickCount: 0, keyDownCount: 0, scrollCount: 0,
+    focusCount: 0, blurCount: 0, visibilityChangeCount: 0,
+    lastPointer: null
+  };
+
+  document.addEventListener('mousemove', (event) => {
+    activity.mouseMoveCount++;
+    if (activity.lastPointer) {
+      const dx = event.clientX - activity.lastPointer.x;
+      const dy = event.clientY - activity.lastPointer.y;
+      activity.mouseDistancePixels += Math.hypot(dx, dy);
+    }
+    activity.lastPointer = { x: event.clientX, y: event.clientY };
+  }, { passive: true });
+
+  document.addEventListener('pointerdown', () => activity.pointerDownCount++, { passive: true });
+  document.addEventListener('click', () => activity.clickCount++, { passive: true });
+  document.addEventListener('keydown', () => activity.keyDownCount++);
+  document.addEventListener('scroll', () => activity.scrollCount++, { passive: true });
+  window.addEventListener('focus', () => activity.focusCount++);
+  window.addEventListener('blur', () => activity.blurCount++);
+  document.addEventListener('visibilitychange', () => activity.visibilityChangeCount++);
+
+  function collectActivity() {
+    return {
+      mouseMoveCount: activity.mouseMoveCount,
+      mouseDistancePixels: Math.round(activity.mouseDistancePixels),
+      pointerDownCount: activity.pointerDownCount,
+      clickCount: activity.clickCount,
+      keyDownCount: activity.keyDownCount,
+      scrollCount: activity.scrollCount,
+      focusCount: activity.focusCount,
+      blurCount: activity.blurCount,
+      visibilityChangeCount: activity.visibilityChangeCount,
+      timeOnPageMs: Math.round(performance.now() - pageOpenedAt)
+    };
+  }
+
+  function getConnectionData() {
+    const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (!connection) return null;
+    return {
+      effectiveType: connection.effectiveType ?? null,
+      downlinkMbps: connection.downlink ?? null,
+      roundTripTimeMs: connection.rtt ?? null,
+      saveData: connection.saveData ?? null
+    };
+  }
+
+  function collectClientData() {
+    return {
+      collectedAt: new Date().toISOString(),
+      page: {
+        origin: location.origin,
+        hostname: location.hostname,
+        pathname: location.pathname,
+        title: document.title,
+        visibilityState: document.visibilityState
+      },
+      navigator: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        languages: navigator.languages,
+        platform: navigator.platform,
+        vendor: navigator.vendor,
+        cookieEnabled: navigator.cookieEnabled,
+        online: navigator.onLine,
+        doNotTrack: navigator.doNotTrack,
+        webdriver: navigator.webdriver,
+        hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+        deviceMemoryGb: navigator.deviceMemory ?? null,
+        maxTouchPoints: navigator.maxTouchPoints ?? null,
+        pdfViewerEnabled: navigator.pdfViewerEnabled ?? null
+      },
+      timezone: {
+        name: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        offsetMinutes: new Date().getTimezoneOffset()
+      },
+      screen: {
+        width: screen.width, height: screen.height,
+        availableWidth: screen.availWidth, availableHeight: screen.availHeight,
+        colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth
+      },
+      viewport: {
+        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+        outerWidth: window.outerWidth, outerHeight: window.outerHeight,
+        devicePixelRatio: window.devicePixelRatio
+      },
+      connection: getConnectionData(),
+      performance: { timeOnPageMs: Math.round(performance.now() - pageOpenedAt) }
+    };
+  }
+
+  let scriptPromise = null;
+  function loadRecaptcha() {
+    if (scriptPromise) return scriptPromise;
+    scriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://www.google.com/recaptcha/api.js?render=' + encodeURIComponent(SITE_KEY);
+      script.async = true;
+      script.onload = () => {
+        if (!window.grecaptcha || typeof grecaptcha.ready !== 'function') {
+          reject(new Error('Библиотека reCAPTCHA не инициализирована.'));
+          return;
+        }
+        grecaptcha.ready(resolve);
+      };
+      script.onerror = () => reject(new Error('Google reCAPTCHA не загрузилась (проверьте сеть или блокировщик).'));
+      document.head.appendChild(script);
+    });
+    return scriptPromise;
+  }
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    scoreBox.hidden = true;
+    resultBox.textContent = '';
+    try {
+      statusBox.textContent = '1/3: загружаем библиотеку reCAPTCHA…';
+      await loadRecaptcha();
+
+      statusBox.textContent = '2/3: получаем новый token от Google…';
+      const tokenStartedAt = performance.now();
+      const token = await grecaptcha.execute(SITE_KEY, { action: ACTION });
+      const tokenDurationMs = Math.round(performance.now() - tokenStartedAt);
+
+      statusBox.textContent = '3/3: Cloudflare Worker проверяет token через Google…';
+      const response = await fetch(WORKER_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({
+          token,
+          requestedAction: ACTION,
+          clientData: {
+            ...collectClientData(),
+            recaptchaExecution: {
+              tokenReceived: true,
+              tokenLength: token.length,
+              executionDurationMs: tokenDurationMs
+            }
+          },
+          activity: collectActivity()
+        })
+      });
+
+      const responseText = await response.text();
+      let result;
+      try {
+        result = JSON.parse(responseText);
+      } catch {
+        throw new Error('Сервер вернул не JSON (HTTP ' + response.status + '): ' + responseText.slice(0, 500));
+      }
+      resultBox.textContent = JSON.stringify(result, null, 2);
+      const score = result?.summary?.score;
+      if (typeof score === 'number') {
+        scoreBox.hidden = false;
+        scoreBox.textContent = 'Полученный score: ' + score.toFixed(2) +
+          (result.ok ? ' · токен подтверждён' : ' · проверка не пройдена');
+      }
+      if (!response.ok) {
+        throw new Error(result.message || result.error || 'HTTP ' + response.status);
+      }
+      statusBox.textContent = result.ok
+        ? 'Проверка завершена успешно. Полный ответ Google и диагностика показаны ниже.'
+        : 'Google вернул результат, но проверка не пройдена. Подробности ниже.';
+    } catch (error) {
+      statusBox.textContent = 'Ошибка: ' + error.message;
+      if (!resultBox.textContent) resultBox.textContent = String(error.stack || error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  </script>
+</body>
+</html>
